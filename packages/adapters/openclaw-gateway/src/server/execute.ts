@@ -139,6 +139,21 @@ function prefixSessionKeyForAgent(sessionKey: string, agentId: string | null): s
   return `agent:${agentId}:${sessionKey}`;
 }
 
+/**
+ * Parse the agent id from an `agent:<id>:...` session key.
+ * Returns null for session keys without the prefix or with malformed bodies.
+ * Exported so tests + audit helpers can reuse the same parser.
+ */
+export function extractAgentIdFromSessionKey(sessionKey: string | null | undefined): string | null {
+  if (!sessionKey) return null;
+  const trimmed = sessionKey.trim();
+  if (!trimmed.startsWith("agent:")) return null;
+  // Match `agent:<id>:` where <id> is one colon-separated segment with no colons.
+  const match = /^agent:([^:]+):/.exec(trimmed);
+  if (!match) return null;
+  return nonEmpty(match[1]);
+}
+
 export function resolveSessionKey(input: {
   strategy: SessionKeyStrategy;
   configuredSessionKey: string | null;
@@ -154,6 +169,58 @@ export function resolveSessionKey(input: {
     return prefixSessionKeyForAgent(`paperclip:issue:${input.issueId}`, input.agentId);
   }
   return prefixSessionKeyForAgent(fallback, input.agentId);
+}
+
+/**
+ * Resolve the effective agentId for an openclaw_gateway wake.
+ *
+ * Resolution order:
+ * 1. `configuredAgentId` (the explicit `adapterConfig.agentId`).
+ * 2. The agent id parsed from the `agent:<id>:` sessionKey prefix.
+ *
+ * Returns null when neither is resolvable. The wake MUST refuse in that case —
+ * silently falling back to OpenClaw agent `main` would misroute wakes into the
+ * wrong session store (regression captured by PHA-1489 / PHA-1888).
+ */
+export function resolveOpenclawGatewayAgentId(input: {
+  configuredAgentId: string | null;
+  sessionKey: string;
+}): { agentId: string | null; source: "configured" | "sessionKey" | null } {
+  if (input.configuredAgentId) {
+    return { agentId: input.configuredAgentId, source: "configured" };
+  }
+  const derived = extractAgentIdFromSessionKey(input.sessionKey);
+  if (derived) {
+    return { agentId: derived, source: "sessionKey" };
+  }
+  return { agentId: null, source: null };
+}
+
+/**
+ * Audit an openclaw_gateway adapter config for agentId/sessionKey mismatches.
+ * Returns an array of warning strings (empty when the config is consistent).
+ *
+ * Intended for use at agent save time (operator UI validation) or at startup
+ * audit (so misroutes are flagged before the first wake fires).
+ */
+export function auditOpenclawGatewayConfig(
+  config: Record<string, unknown>,
+): string[] {
+  const warnings: string[] = [];
+  const agentId = nonEmpty(config.agentId);
+  const sessionKey = nonEmpty(config.sessionKey);
+  const sessionKeyAgentId = extractAgentIdFromSessionKey(sessionKey);
+
+  if (agentId && sessionKeyAgentId && agentId !== sessionKeyAgentId) {
+    warnings.push(
+      `openclaw_gateway config mismatch: adapterConfig.agentId=${JSON.stringify(agentId)} ` +
+        `but adapterConfig.sessionKey=${JSON.stringify(sessionKey)} ` +
+        `resolves to agentId=${JSON.stringify(sessionKeyAgentId)}. ` +
+        `Wakes will be routed to the configured agentId and the sessionKey prefix will be ignored.`,
+    );
+  }
+
+  return warnings;
 }
 
 function isLoopbackHost(hostname: string): boolean {
@@ -1109,6 +1176,43 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     issueId: wakePayload.issueId,
   });
 
+  // Resolve the effective agentId. If neither the explicit config nor the
+  // sessionKey prefix is resolvable, REFUSE the wake with an explicit error —
+  // never silently fall back to OpenClaw agent `main` (PHA-1888 / PHA-1489).
+  const agentIdResolution = resolveOpenclawGatewayAgentId({
+    configuredAgentId,
+    sessionKey,
+  });
+  const auditTrail = auditOpenclawGatewayConfig(parseObject(ctx.config));
+  const auditSuffix = auditTrail.length > 0 ? ` audit=${JSON.stringify(auditTrail)}` : "";
+  if (!agentIdResolution.agentId) {
+    return {
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorMessage:
+        `openclaw_gateway cannot resolve a target agentId: ` +
+        `adapterConfig.agentId is unset and sessionKey=${JSON.stringify(sessionKey)} ` +
+        `has no "agent:<id>:" prefix. ` +
+        `Refusing to wake to avoid silent fallback to OpenClaw agent "main". ` +
+        `Set adapterConfig.agentId explicitly (e.g. "engineer" for Van Dam, "main" for Ledger).`,
+      errorCode: "openclaw_gateway_agent_id_unresolved",
+      errorMeta: {
+        configuredAgentId: configuredAgentId ?? null,
+        sessionKey,
+        sessionKeyStrategy,
+        audit: auditTrail,
+      },
+      resultJson: { agentIdUnresolved: true, sessionKey, auditTrail: auditTrail },
+    };
+  }
+  const resolvedAgentId = agentIdResolution.agentId;
+  await ctx.onLog(
+    "stdout",
+    `[openclaw-gateway] resolved agentId=${JSON.stringify(resolvedAgentId)} ` +
+      `source=${agentIdResolution.source} sessionKey=${JSON.stringify(sessionKey)}${auditSuffix}\n`,
+  );
+
   const templateMessage = nonEmpty(payloadTemplate.message) ?? nonEmpty(payloadTemplate.text);
   const message = templateMessage ? appendWakeText(templateMessage, wakeText) : wakeText;
 
@@ -1117,7 +1221,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     message,
     sessionKey,
     runId: ctx.runId,
-    configuredAgentId,
+    configuredAgentId: resolvedAgentId,
     waitTimeoutMs,
   });
 
