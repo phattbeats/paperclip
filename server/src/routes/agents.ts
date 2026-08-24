@@ -1933,7 +1933,7 @@ export function agentRoutes(
       const id = req.params.id as string;
       const agent = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
       if (!agent) return;
-      await assertCanUpdateAgent(req, agent);
+      await assertCanApplyProtectedAgentChange(req, agent, [agentProfileChangeTargetKey(agent.id)]);
 
       const requestedSkills = normalizeDesiredSkillSelections(req.body.desiredSkills);
       const {
