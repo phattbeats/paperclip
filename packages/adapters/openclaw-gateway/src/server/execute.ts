@@ -539,6 +539,110 @@ export async function clearSessionRunIdOnServer(input: {
 }
 
 /**
+ * Mint a run-bound JWT for this wake from the Paperclip control plane
+ * (PHA-2752). OpenClaw-routed wakes (this adapter) cannot fetch secret
+ * values via `/api/agents/me/secrets/{name}/value` because the server's
+ * secrets service requires `actorSource === "agent_jwt"`, which is
+ * verified by HS256 against the run_id claim — the long-lived static
+ * `pcp_…` agent key carries no such signature.
+ *
+ * The server-side mint endpoint `POST /api/internal/agents/{agentId}/run-bearer`
+ * runs `createLocalAgentJwt(agentId, companyId, adapterType, runId, …)` and
+ * returns the JWT. The adapter then injects that JWT as `PAPERCLIP_API_KEY`
+ * in the wake prompt env block so the agent's outbound HTTP authenticates
+ * as `actorSource: "agent_jwt"`.
+ *
+ * Best-effort: any failure (network, 4xx/5xx, malformed response) returns
+ * `{ ok: false }` and logs. The caller MUST fall back to the static claimed
+ * key so the wake still proceeds (issue / POST-comment / checkout still
+ * accept static-key auth via `X-Paperclip-Run-Id`).
+ *
+ * The response shape is `{ token: string, expiresAt?: string | number }`.
+ */
+export async function mintRunBoundJwtOnServer(input: {
+  paperclipApiUrl: string;
+  apiKey: string;
+  agentId: string;
+  runId: string;
+  onLog?: (stream: "stdout" | "stderr", text: string) => Promise<void> | void;
+  fetchImpl?: typeof fetch;
+  timeoutMs?: number;
+}): Promise<{ ok: true; token: string; expiresAt?: string | number } | { ok: false; error: string }> {
+  const { paperclipApiUrl, apiKey, agentId, runId, onLog, timeoutMs, fetchImpl } = input;
+  const url = joinUrlPath(paperclipApiUrl, `/api/internal/agents/${encodeURIComponent(agentId)}/run-bearer`);
+  if (!url) return { ok: false, error: "invalid paperclipApiUrl" };
+  const doFetch = fetchImpl ?? fetch;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs ?? 5_000);
+  try {
+    const res = await doFetch(url, {
+      method: "POST",
+      headers: {
+        authorization: toAuthorizationHeaderValue(apiKey),
+        "content-type": "application/json",
+        accept: "application/json",
+      },
+      body: JSON.stringify({ runId }),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const errorText = await res.text().catch(() => "");
+      const error = `POST /api/internal/agents/${agentId}/run-bearer returned ${res.status}: ${truncateForLog(errorText, 200)}`;
+      if (onLog) {
+        await onLog("stderr", `[openclaw-gateway] run-jwt mint failed: ${error}\n`);
+      }
+      return { ok: false, error };
+    }
+    let parsed: unknown;
+    try {
+      parsed = await res.json();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const error = `POST /api/internal/agents/${agentId}/run-bearer returned non-JSON: ${message}`;
+      if (onLog) {
+        await onLog("stderr", `[openclaw-gateway] run-jwt mint failed: ${error}\n`);
+      }
+      return { ok: false, error };
+    }
+    if (!parsed || typeof parsed !== "object") {
+      const error = `POST /api/internal/agents/${agentId}/run-bearer returned non-object body`;
+      if (onLog) {
+        await onLog("stderr", `[openclaw-gateway] run-jwt mint failed: ${error}\n`);
+      }
+      return { ok: false, error };
+    }
+    const record = parsed as Record<string, unknown>;
+    const token = nonEmpty(record.token);
+    if (!token) {
+      const error = `POST /api/internal/agents/${agentId}/run-bearer returned body without token field`;
+      if (onLog) {
+        await onLog("stderr", `[openclaw-gateway] run-jwt mint failed: ${error}\n`);
+      }
+      return { ok: false, error };
+    }
+    const expiresAt = record.expiresAt;
+    if (onLog) {
+      await onLog(
+        "stdout",
+        `[openclaw-gateway] minted run-bound JWT for agentId=${agentId} runId=${runId} via POST ${url}\n`,
+      );
+    }
+    return expiresAt === undefined
+      ? { ok: true, token }
+      : { ok: true, token, expiresAt: expiresAt as string | number };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const error = `POST /api/internal/agents/${agentId}/run-bearer threw: ${message}`;
+    if (onLog) {
+      await onLog("stderr", `[openclaw-gateway] run-jwt mint failed: ${error}\n`);
+    }
+    return { ok: false, error };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
  * Compose a URL with the given path appended to the base, handling trailing
  * slashes on the base and leading slashes on the path.
  */
@@ -590,7 +694,11 @@ export async function readClaimedApiKey(
   return { token, agentId, companyId };
 }
 
-function buildPaperclipEnvForWake(ctx: AdapterExecutionContext, wakePayload: WakePayload): Record<string, string> {
+function buildPaperclipEnvForWake(
+  ctx: AdapterExecutionContext,
+  wakePayload: WakePayload,
+  options?: { runBoundJwt?: string | null },
+): Record<string, string> {
   const paperclipApiUrlOverride = resolvePaperclipApiUrlOverride(ctx.config.paperclipApiUrl);
   const paperclipEnv: Record<string, string> = {
     ...buildPaperclipEnv(ctx.agent),
@@ -609,6 +717,17 @@ function buildPaperclipEnvForWake(ctx: AdapterExecutionContext, wakePayload: Wak
   if (wakePayload.approvalStatus) paperclipEnv.PAPERCLIP_APPROVAL_STATUS = wakePayload.approvalStatus;
   if (wakePayload.issueIds.length > 0) {
     paperclipEnv.PAPERCLIP_LINKED_ISSUE_IDS = wakePayload.issueIds.join(",");
+  }
+
+  // PHA-2752: when the caller successfully minted a run-bound JWT from the
+  // server's `/api/internal/agents/{id}/run-bearer` endpoint, inject it as
+  // PAPERCLIP_API_KEY so the agent's outbound HTTP authenticates as
+  // `actorSource: "agent_jwt"` and gains access to `/api/agents/me/secrets/*`.
+  // When mint fails or is skipped, PAPERCLIP_API_KEY is left unset in the env
+  // block and the agent runtime falls back to the long-lived static claimed
+  // key from `paperclip-claimed-api-key.json` (its pre-PHA-2752 behavior).
+  if (options?.runBoundJwt) {
+    paperclipEnv.PAPERCLIP_API_KEY = options.runBoundJwt;
   }
 
   return paperclipEnv;
@@ -643,6 +762,26 @@ function buildWakeText(
   const issueIdHint = payload.taskId ?? payload.issueId ?? "";
   const apiBaseHint = paperclipEnv.PAPERCLIP_API_URL ?? "<set PAPERCLIP_API_URL>";
 
+  // PHA-2752: when PAPERCLIP_API_KEY is present in the env block, the adapter
+  // minted a run-bound JWT for this wake — surface it inline so the agent
+  // runtime uses it directly. When absent, fall back to instructing the agent
+  // to load the long-lived static claimed key from disk (pre-PHA-2752 path).
+  const hasRunBoundJwt = Boolean(paperclipEnv.PAPERCLIP_API_KEY);
+  const apiKeyLine = hasRunBoundJwt
+    ? `PAPERCLIP_API_KEY=<run-bound JWT, valid for this wake only>`
+    : `PAPERCLIP_API_KEY=<token from ${claimedApiKeyPath}>`;
+  const apiKeyFallbackBlock = hasRunBoundJwt
+    ? [
+        "The adapter minted a fresh run-bound JWT for this wake — it is the value",
+        "of $PAPERCLIP_API_KEY below. Use it as Bearer token on every API call.",
+        "Do not load the claimed key from disk for this wake; the JWT is the",
+        "authoritative credential and is the only one that grants access to",
+        "/api/agents/me/secrets/* (PHA-2752).",
+      ]
+    : [
+        `Load PAPERCLIP_API_KEY from ${claimedApiKeyPath} (the token you saved after claim-api-key).`,
+      ];
+
   const lines = [
     "Paperclip wake event for a cloud adapter.",
     "",
@@ -650,9 +789,9 @@ function buildWakeText(
     "",
     "Set these values in your run context:",
     ...envLines,
-    `PAPERCLIP_API_KEY=<token from ${claimedApiKeyPath}>`,
+    apiKeyLine,
     "",
-    `Load PAPERCLIP_API_KEY from ${claimedApiKeyPath} (the token you saved after claim-api-key).`,
+    ...apiKeyFallbackBlock,
     "",
     `api_base=${apiBaseHint}`,
     `task_id=${payload.taskId ?? ""}`,
@@ -1336,7 +1475,45 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const disableDeviceAuth = parseBoolean(ctx.config.disableDeviceAuth, false);
 
   const wakePayload = buildWakePayload(ctx);
-  const paperclipEnv = buildPaperclipEnvForWake(ctx, wakePayload);
+
+  // PHA-2752: try to mint a run-bound JWT from the Paperclip control plane
+  // before building the wake prompt. If the mint succeeds the JWT is
+  // injected as PAPERCLIP_API_KEY so the agent's outbound HTTP can hit the
+  // secrets API (which requires actorSource === "agent_jwt"). If mint
+  // fails the wake proceeds with the static claimed key (pre-PHA-2752
+  // behavior — secrets API still 403s, but issue/comment/checkout still
+  // work via the session-bind + X-Paperclip-Run-Id path).
+  let runBoundJwt: string | null = null;
+  const paperclipApiUrlForMint = resolvePaperclipApiUrlOverride(ctx.config.paperclipApiUrl);
+  if (paperclipApiUrlForMint) {
+    const claimedApiKeyPath = resolveClaimedApiKeyPath(ctx.config.claimedApiKeyPath);
+    const claimed = await readClaimedApiKey(claimedApiKeyPath);
+    if (claimed) {
+      const mintResult = await mintRunBoundJwtOnServer({
+        paperclipApiUrl: paperclipApiUrlForMint,
+        apiKey: claimed.token,
+        agentId: ctx.agent.id,
+        runId: ctx.runId,
+        onLog: ctx.onLog,
+      });
+      if (mintResult.ok) {
+        runBoundJwt = mintResult.token;
+      }
+      // mintResult.ok === false already logged via onLog inside the helper.
+    } else {
+      await ctx.onLog(
+        "stderr",
+        `[openclaw-gateway] run-jwt mint skipped: could not load claimed API key from ${claimedApiKeyPath}\n`,
+      );
+    }
+  } else {
+    await ctx.onLog(
+      "stderr",
+      `[openclaw-gateway] run-jwt mint skipped: paperclipApiUrl is not configured for this adapter\n`,
+    );
+  }
+
+  const paperclipEnv = buildPaperclipEnvForWake(ctx, wakePayload, { runBoundJwt });
   // No heartbeat prompt template is sent over the gateway, so the wake prompt
   // must carry the execution contract itself.
   const structuredWakePrompt = renderPaperclipWakePrompt(ctx.context.paperclipWake, {

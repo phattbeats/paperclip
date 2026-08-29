@@ -9,6 +9,7 @@ import {
   buildAgentParams,
   clearSessionRunIdOnServer,
   extractAgentIdFromSessionKey,
+  mintRunBoundJwtOnServer,
   readClaimedApiKey,
   resolveClaimedApiKeyPath,
   resolveOpenclawGatewayAgentId,
@@ -460,5 +461,240 @@ describe("readClaimedApiKey", () => {
     if (!home) return; // skip on platforms without HOME
     const result = await readClaimedApiKey(`~/${Math.random()}-does-not-exist.json`);
     expect(result).toBeNull();
+  });
+});
+
+describe("mintRunBoundJwtOnServer", () => {
+  function makeFetch(responses: Array<{ status: number; body?: string } | Error>): {
+    fetchImpl: typeof fetch;
+    calls: Array<{ url: string; init: RequestInit }>;
+  } {
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    let i = 0;
+    const fetchImpl = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(url), init: init ?? {} });
+      const next = responses[i++] ?? { status: 200, body: "{}" };
+      if (next instanceof Error) throw next;
+      return new Response(next.body ?? "{}", { status: next.status });
+    }) as unknown as typeof fetch;
+    return { fetchImpl, calls };
+  }
+
+  it("POSTs the runId to /api/internal/agents/{id}/run-bearer with bearer auth and returns the token", async () => {
+    const { fetchImpl, calls } = makeFetch([
+      { status: 200, body: '{"token":"jwt.abc.def","expiresAt":4102444800}' },
+    ]);
+    const result = await mintRunBoundJwtOnServer({
+      paperclipApiUrl: "http://10.0.0.100:3100/",
+      apiKey: "pcp_test",
+      agentId: "agent-1234",
+      runId: "11111111-2222-3333-4444-555555555555",
+      fetchImpl,
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.token).toBe("jwt.abc.def");
+      expect(result.expiresAt).toBe(4102444800);
+    }
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe("http://10.0.0.100:3100/api/internal/agents/agent-1234/run-bearer");
+    expect(calls[0].init.method).toBe("POST");
+    const headers = new Headers(calls[0].init.headers as HeadersInit);
+    expect(headers.get("authorization")).toBe("Bearer pcp_test");
+    expect(headers.get("content-type")).toBe("application/json");
+    expect(JSON.parse(calls[0].init.body as string)).toEqual({
+      runId: "11111111-2222-3333-4444-555555555555",
+    });
+  });
+
+  it("encodes agentId segments in the URL path", async () => {
+    const { fetchImpl, calls } = makeFetch([{ status: 200, body: '{"token":"jwt.x.y"}' }]);
+    await mintRunBoundJwtOnServer({
+      paperclipApiUrl: "http://10.0.0.100:3100",
+      apiKey: "pcp_test",
+      agentId: "agent with spaces/and/slashes",
+      runId: "run-1",
+      fetchImpl,
+    });
+    expect(calls[0].url).toBe(
+      "http://10.0.0.100:3100/api/internal/agents/agent%20with%20spaces%2Fand%2Fslashes/run-bearer",
+    );
+  });
+
+  it("accepts a missing expiresAt field", async () => {
+    const { fetchImpl } = makeFetch([{ status: 200, body: '{"token":"jwt.x.y"}' }]);
+    const result = await mintRunBoundJwtOnServer({
+      paperclipApiUrl: "http://10.0.0.100:3100",
+      apiKey: "pcp_test",
+      agentId: "agent-1",
+      runId: "run-1",
+      fetchImpl,
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.token).toBe("jwt.x.y");
+      expect(result.expiresAt).toBeUndefined();
+    }
+  });
+
+  it("returns ok:false when the server returns non-2xx", async () => {
+    const { fetchImpl } = makeFetch([{ status: 503, body: "down" }]);
+    const result = await mintRunBoundJwtOnServer({
+      paperclipApiUrl: "http://10.0.0.100:3100",
+      apiKey: "pcp_test",
+      agentId: "agent-1",
+      runId: "run-1",
+      fetchImpl,
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toMatch(/503/);
+    }
+  });
+
+  it("returns ok:false when the body is not JSON", async () => {
+    const { fetchImpl } = makeFetch([{ status: 200, body: "<html>not json</html>" }]);
+    const result = await mintRunBoundJwtOnServer({
+      paperclipApiUrl: "http://10.0.0.100:3100",
+      apiKey: "pcp_test",
+      agentId: "agent-1",
+      runId: "run-1",
+      fetchImpl,
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toMatch(/non-JSON/);
+    }
+  });
+
+  it("returns ok:false when the body is a JSON array (non-object)", async () => {
+    const { fetchImpl } = makeFetch([{ status: 200, body: "[]" }]);
+    const result = await mintRunBoundJwtOnServer({
+      paperclipApiUrl: "http://10.0.0.100:3100",
+      apiKey: "pcp_test",
+      agentId: "agent-1",
+      runId: "run-1",
+      fetchImpl,
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      // A JSON array parses as typeof "object" but has no `token` property,
+      // so the missing-token guard fires. The error message is the
+      // contract the caller logs; verify it.
+      expect(result.error).toMatch(/without token/);
+    }
+  });
+
+  it("returns ok:false when the token field is missing", async () => {
+    const { fetchImpl } = makeFetch([{ status: 200, body: '{"expiresAt":4102444800}' }]);
+    const result = await mintRunBoundJwtOnServer({
+      paperclipApiUrl: "http://10.0.0.100:3100",
+      apiKey: "pcp_test",
+      agentId: "agent-1",
+      runId: "run-1",
+      fetchImpl,
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toMatch(/without token/);
+    }
+  });
+
+  it("returns ok:false when the token field is an empty string", async () => {
+    const { fetchImpl } = makeFetch([{ status: 200, body: '{"token":""}' }]);
+    const result = await mintRunBoundJwtOnServer({
+      paperclipApiUrl: "http://10.0.0.100:3100",
+      apiKey: "pcp_test",
+      agentId: "agent-1",
+      runId: "run-1",
+      fetchImpl,
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toMatch(/without token/);
+    }
+  });
+
+  it("returns ok:false when the fetch throws", async () => {
+    const { fetchImpl } = makeFetch([new Error("ECONNREFUSED")]);
+    const result = await mintRunBoundJwtOnServer({
+      paperclipApiUrl: "http://10.0.0.100:3100",
+      apiKey: "pcp_test",
+      agentId: "agent-1",
+      runId: "run-1",
+      fetchImpl,
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toMatch(/ECONNREFUSED/);
+    }
+  });
+
+  it("returns ok:false on invalid paperclipApiUrl", async () => {
+    const result = await mintRunBoundJwtOnServer({
+      paperclipApiUrl: "not a url",
+      apiKey: "pcp_test",
+      agentId: "agent-1",
+      runId: "run-1",
+      fetchImpl: vi.fn() as unknown as typeof fetch,
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toMatch(/invalid paperclipApiUrl/);
+    }
+  });
+
+  it("aborts on timeout", async () => {
+    const fetchImpl = vi.fn((_url: string | URL | Request, init?: RequestInit) => {
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          reject(new DOMException("aborted", "AbortError"));
+        });
+      });
+    }) as unknown as typeof fetch;
+    const result = await mintRunBoundJwtOnServer({
+      paperclipApiUrl: "http://10.0.0.100:3100",
+      apiKey: "pcp_test",
+      agentId: "agent-1",
+      runId: "run-1",
+      fetchImpl,
+      timeoutMs: 5,
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toMatch(/aborted|threw/i);
+    }
+  });
+
+  it("invokes onLog('stderr') on non-2xx response", async () => {
+    const { fetchImpl } = makeFetch([{ status: 403, body: "forbidden" }]);
+    const onLog = vi.fn();
+    await mintRunBoundJwtOnServer({
+      paperclipApiUrl: "http://10.0.0.100:3100",
+      apiKey: "pcp_test",
+      agentId: "agent-1",
+      runId: "run-1",
+      fetchImpl,
+      onLog,
+    });
+    const stderrCalls = onLog.mock.calls.filter((c) => c[0] === "stderr");
+    expect(stderrCalls.length).toBeGreaterThanOrEqual(1);
+    expect(stderrCalls[0][1]).toMatch(/run-jwt mint failed/);
+  });
+
+  it("invokes onLog('stdout') on success", async () => {
+    const { fetchImpl } = makeFetch([{ status: 200, body: '{"token":"jwt.x.y"}' }]);
+    const onLog = vi.fn();
+    await mintRunBoundJwtOnServer({
+      paperclipApiUrl: "http://10.0.0.100:3100",
+      apiKey: "pcp_test",
+      agentId: "agent-1",
+      runId: "run-1",
+      fetchImpl,
+      onLog,
+    });
+    const stdoutCalls = onLog.mock.calls.filter((c) => c[0] === "stdout");
+    expect(stdoutCalls.length).toBeGreaterThanOrEqual(1);
+    expect(stdoutCalls[0][1]).toMatch(/minted run-bound JWT/);
   });
 });
