@@ -1,5 +1,11 @@
 # @paperclipai/db
 
+## Unreleased
+
+### Patch Changes
+
+- Add `run_jwt_mint_events` table for auditing run-bound JWT mints (PHA-2755).
+
 ## 0.3.1
 
 ### Patch Changes

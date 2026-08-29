@@ -1366,6 +1366,13 @@
       "when": 1786010000000,
       "tag": "0207_agent_api_key_session_bound_run_id",
       "breakpoints": true
+    },
+    {
+      "idx": 197,
+      "version": "7",
+      "when": 1786010000001,
+      "tag": "0208_run_jwt_mint_events",
+      "breakpoints": true
     }
   ]
 }

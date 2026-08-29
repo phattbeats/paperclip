@@ -76,6 +76,7 @@ export type {
 export { approvalService } from "./approvals.js";
 export { budgetService } from "./budgets.js";
 export { secretService } from "./secrets.js";
+export { runJwtService } from "./run-jwt.js";
 export { googleSheetsRobotEmailFromEnv, toolAccessService } from "./tool-access.js";
 export { smokeLabService } from "./smoke-lab.js";
 export { backfillLegacyToolOAuthTokens } from "./tool-oauth-legacy-backfill.js";

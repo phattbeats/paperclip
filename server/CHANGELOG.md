@@ -1,5 +1,11 @@
 # @paperclipai/server
 
+## Unreleased
+
+### Patch Changes
+
+- Add `POST /api/internal/agents/:agentId/run-bearer` to mint short-lived run-bound JWTs for adapter wake spawn (PHA-2755, paired with PHA-2752). Audit log written to `run_jwt_mint_events` with companyId, agentId, runId, actor agent key id, and JWT exp.
+
 ## 0.3.1
 
 ### Patch Changes
