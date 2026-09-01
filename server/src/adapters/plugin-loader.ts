@@ -141,6 +141,63 @@ function extractUiParserSource(
 }
 
 // ---------------------------------------------------------------------------
+// Load outcome tracking
+// ---------------------------------------------------------------------------
+
+export type AdapterLoadStatus = "loaded" | "failed" | "not_declared";
+
+export interface AdapterLoadFailure {
+  type: string;
+  packageName: string;
+  packageDir: string;
+  error: string;
+  /** True if the plugin was declared `optional: true` in its package.json. */
+  optional: boolean;
+  timestamp: string;
+}
+
+/**
+ * Module-scoped record of every plugin that failed to load at boot or via
+ * runtime reload. The registry reads this list to populate the health
+ * endpoint and the GET /api/adapters/:type status field. Cleared by a
+ * successful reload of the same type.
+ */
+const failedLoads = new Map<string, AdapterLoadFailure>();
+
+/**
+ * Whether the next external plugin to fail should be treated as required
+ * (boot-time must surface the failure) or optional (silently fall through
+ * to the built-in). Set from `package.json.paperclip.optional` at load time.
+ */
+function isOptionalPlugin(packageDir: string): boolean {
+  try {
+    const raw = fs.readFileSync(path.join(packageDir, "package.json"), "utf-8");
+    const pkg = JSON.parse(raw);
+    return pkg.paperclip?.optional === true;
+  } catch {
+    return false;
+  }
+}
+
+/** Public read of the failure list. Read-only by reference — never mutate. */
+export function getFailedAdapterLoads(): AdapterLoadFailure[] {
+  return Array.from(failedLoads.values());
+}
+
+/** Clear a recorded failure once the same type has loaded successfully. */
+export function clearFailedAdapterLoad(type: string): void {
+  failedLoads.delete(type);
+}
+
+export function getAdapterLoadStatus(type: string): AdapterLoadStatus {
+  if (failedLoads.has(type)) return "failed";
+  // The actual `loaded` distinction is owned by registry.ts (which has the
+  // adaptersByType map). The caller should consult findServerAdapter(type)
+  // and combine with this status to render "loaded" vs "not_declared".
+  return "not_declared";
+}
+
+// ---------------------------------------------------------------------------
 // Load / reload
 // ---------------------------------------------------------------------------
 
@@ -187,14 +244,56 @@ export async function loadExternalAdapterPackage(
   return adapterModule;
 }
 
+/**
+ * Load a single external adapter from its plugin-store record.
+ *
+ * Returns the loaded module on success. On failure, records the error in the
+ * module-scoped `failedLoads` map (read by getFailedAdapterLoads) so the
+ * health endpoint, GET /api/adapters/:type, and the operator can see that
+ * the plugin is broken — instead of silently falling through to the built-in.
+ *
+ * An `optional: true` plugin (declared in its package.json under the
+ * `paperclip` key) is allowed to fail without recording a load failure: the
+ * goal is "this is a best-effort enhancement, the built-in is fine."
+ *
+ * A *required* plugin (the default) still returns null on failure so the
+ * IIFE consumer does not throw — but the failure IS recorded. The server
+ * stays up (so DB-backed work survives), but the operator gets a loud signal
+ * via /api/health, /api/adapters/:type, and the boot log.
+ */
 async function loadFromRecord(record: AdapterPluginRecord): Promise<ServerAdapterModule | null> {
+  const packageDir = resolvePackageDir(record);
+  const optional = isOptionalPlugin(packageDir);
+
   try {
-    return await loadExternalAdapterPackage(record.packageName, record.localPath);
+    const adapter = await loadExternalAdapterPackage(record.packageName, record.localPath);
+    clearFailedAdapterLoad(record.type);
+    return adapter;
   } catch (err) {
-    logger.warn(
-      { err, packageName: record.packageName, type: record.type },
-      "Failed to dynamically load external adapter; skipping",
+    const message = err instanceof Error ? err.message : String(err);
+
+    if (optional) {
+      logger.warn(
+        { err, packageName: record.packageName, type: record.type, optional: true },
+        "Optional external adapter failed to load — built-in will serve traffic",
+      );
+      // Do NOT record this as a load failure; the operator marked it best-effort.
+      return null;
+    }
+
+    logger.error(
+      { err, packageName: record.packageName, type: record.type, packageDir },
+      `External adapter "${record.packageName}" FAILED to load: ${message}`,
     );
+    failedLoads.set(record.type, {
+      type: record.type,
+      packageName: record.packageName,
+      packageDir,
+      error: message,
+      optional: false,
+      timestamp: new Date().toISOString(),
+    });
+    // Return null so the IIFE does not throw, but the failure is recorded.
     return null;
   }
 }
@@ -202,6 +301,15 @@ async function loadFromRecord(record: AdapterPluginRecord): Promise<ServerAdapte
 /**
  * Reload an external adapter at runtime (dev iteration without server restart).
  * Busts the ESM module cache via a cache-busting query string.
+ *
+ * Throws (does NOT return null) on actual load failure when the record exists
+ * but the package.json entry point is broken or the module throws on import.
+ * This is the post-boot counterpart to buildExternalAdapters: an agent that
+ * calls POST /api/adapters/:type/reload needs to know *why* it failed, not
+ * just "the adapter is still missing."
+ *
+ * Returns null only when the type has no plugin-store record at all (the
+ * caller, the reload route, maps that to a 404 — "not an external adapter").
  */
 export async function reloadExternalAdapter(
   type: string,
@@ -235,14 +343,42 @@ export async function reloadExternalAdapter(
     "Reloading external adapter (cache bust)",
   );
 
-  const mod = await import(cacheBustUrl);
-  const adapterModule = validateAdapterModule(mod, record.packageName);
+  let adapterModule: ServerAdapterModule;
+  try {
+    const mod = await import(cacheBustUrl);
+    adapterModule = validateAdapterModule(mod, record.packageName);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const optional = isOptionalPlugin(packageDir);
+    logger.error(
+      { err, type, packageName: record.packageName, modulePath },
+      `External adapter "${record.packageName}" FAILED to reload: ${message}`,
+    );
+    if (!optional) {
+      failedLoads.set(type, {
+        type,
+        packageName: record.packageName,
+        packageDir,
+        error: message,
+        optional: false,
+        timestamp: new Date().toISOString(),
+      });
+    }
+    // Re-throw so the caller (route handler) returns a structured 5xx body
+    // instead of a silent 404. The previous behavior returned null on any
+    // failure, which conflated "no such record" with "the record exists but
+    // is broken" — exactly the silent-skip mode PHA-1658 was filed against.
+    throw err;
+  }
 
   uiParserCache.delete(type);
   const uiParserSource = extractUiParserSource(packageDir, record.packageName);
   if (uiParserSource) {
     uiParserCache.set(adapterModule.type, uiParserSource);
   }
+
+  // Successful reload — clear any prior failure record for this type.
+  clearFailedAdapterLoad(type);
 
   logger.info(
     { type, packageName: record.packageName, hasUiParser: !!uiParserSource },

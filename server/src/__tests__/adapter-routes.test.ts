@@ -20,6 +20,8 @@ const mockPluginLoader = vi.hoisted(() => ({
   getUiParserSource: vi.fn(),
   getOrExtractUiParserSource: vi.fn(),
   reloadExternalAdapter: vi.fn(),
+  getFailedAdapterLoads: vi.fn(() => []),
+  getAdapterLoadStatus: vi.fn(() => "not_declared" as const),
 }));
 
 const overridingConfigSchemaAdapter: ServerAdapterModule = {
@@ -102,6 +104,8 @@ describe("adapter routes", () => {
     mockPluginLoader.getUiParserSource.mockResolvedValue(null);
     mockPluginLoader.getOrExtractUiParserSource.mockResolvedValue(null);
     mockPluginLoader.reloadExternalAdapter.mockResolvedValue(null);
+    mockPluginLoader.getFailedAdapterLoads.mockReturnValue([]);
+    mockPluginLoader.getAdapterLoadStatus.mockReturnValue("not_declared");
     const [registry, routes, middleware] = await Promise.all([
       vi.importActual<typeof import("../adapters/registry.js")>("../adapters/registry.js"),
       import("../routes/adapters.js"),
@@ -520,5 +524,106 @@ describe("adapter routes", () => {
     unregisterServerAdapter("codex_local");
     expect(findServerAdapter("codex_local")).toBe(builtin);
     setOverridePaused("codex_local", false);
+  });
+
+  // ──────────────────────────────────────────────────────────────────
+  // PHA-1658: plugin load failures must surface in startup health, not
+  // silently skip. These tests pin the new contract on GET /adapters/:type
+  // (200 with loaded:"failed") and POST /adapters/:type/reload (structured
+  // 500 instead of silent 404).
+  // ──────────────────────────────────────────────────────────────────
+
+  it("GET /api/adapters/:type returns loaded:\"failed\" with error detail when plugin load failed", async () => {
+    unregisterServerAdapter("broken_plugin_test");
+    mockAdapterPluginStore.getAdapterPluginByType.mockReturnValue({
+      type: "broken_plugin_test",
+      packageName: "@paperclip/broken-plugin",
+      localPath: "/tmp/paperclip-broken",
+      installedAt: "2026-09-01T00:00:00Z",
+    });
+    mockPluginLoader.getFailedAdapterLoads.mockReturnValue([
+      {
+        type: "broken_plugin_test",
+        packageName: "@paperclip/broken-plugin",
+        packageDir: "/tmp/paperclip-broken",
+        error: "Cannot find module 'does-not-exist.js'",
+        optional: false,
+        timestamp: "2026-09-01T00:00:00.000Z",
+      },
+    ]);
+
+    const app = createApp();
+    const res = await request(app).get("/api/adapters/broken_plugin_test");
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      type: "broken_plugin_test",
+      loaded: "failed",
+      packageName: "@paperclip/broken-plugin",
+      loadError: {
+        packageName: "@paperclip/broken-plugin",
+        error: "Cannot find module 'does-not-exist.js'",
+        timestamp: "2026-09-01T00:00:00.000Z",
+      },
+    });
+    // No `modelsCount` masquerading as success — a failed plugin reports 0.
+    expect(res.body.modelsCount).toBe(0);
+  });
+
+  it("GET /api/adapters/:type returns loaded:\"loaded\" for a healthy adapter", async () => {
+    registerServerAdapter({
+      type: "healthy_test",
+      execute: async () => ({ exitCode: 0, signal: null, timedOut: false }),
+      testEnvironment: async () => ({
+        adapterType: "healthy_test",
+        status: "pass",
+        checks: [],
+        testedAt: new Date(0).toISOString(),
+      }),
+      models: [],
+      supportsLocalAgentJwt: false,
+    });
+    mockPluginLoader.getFailedAdapterLoads.mockReturnValue([]);
+
+    const app = createApp();
+    const res = await request(app).get("/api/adapters/healthy_test");
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      type: "healthy_test",
+      loaded: "loaded",
+    });
+    expect(res.body.loadError).toBeUndefined();
+  });
+
+  it("POST /api/adapters/:type/reload returns 500 with structured body when reload throws", async () => {
+    mockAdapterPluginStore.getAdapterPluginByType.mockReturnValue({
+      type: "broken_plugin_test",
+      packageName: "@paperclip/broken-plugin",
+      localPath: "/tmp/paperclip-broken",
+      installedAt: "2026-09-01T00:00:00Z",
+    });
+    mockPluginLoader.reloadExternalAdapter.mockRejectedValue(
+      Object.assign(new Error("Cannot find module 'does-not-exist.js'"), { code: "ERR_MODULE_NOT_FOUND" }),
+    );
+
+    const appWithAdmin = createApp({ isInstanceAdmin: true });
+    const res = await request(appWithAdmin).post("/api/adapters/broken_plugin_test/reload");
+    expect(res.status).toBe(500);
+    expect(res.body).toMatchObject({
+      type: "broken_plugin_test",
+      loaded: "failed",
+      packageName: "@paperclip/broken-plugin",
+      loadError: "Cannot find module 'does-not-exist.js'",
+    });
+    expect(res.body.error).toMatch(/Failed to reload adapter/);
+  });
+
+  it("POST /api/adapters/:type/reload still returns 404 when there is no plugin-store record (not a real failure)", async () => {
+    mockAdapterPluginStore.getAdapterPluginByType.mockReturnValue(undefined);
+    mockPluginLoader.reloadExternalAdapter.mockResolvedValue(null);
+
+    const appWithAdmin = createApp({ isInstanceAdmin: true });
+    const res = await request(appWithAdmin).post("/api/adapters/never_installed/reload");
+    expect(res.status).toBe(404);
+    expect(res.body.error).toMatch(/not an externally installed adapter/);
   });
 });

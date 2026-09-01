@@ -16,6 +16,8 @@ import {
 } from "../services/database-backup-health.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { serverVersion } from "../version.js";
+import { getFailedAdapterLoads } from "../adapters/plugin-loader.js";
+import { findAdapterLoadStatus } from "../adapters/registry.js";
 
 function shouldExposeFullHealthDetails(
   actorType: "none" | "board" | "agent" | null | undefined,
@@ -125,6 +127,31 @@ export function healthRoutes(
       exposeFullDetails || hasDevServerStatusToken(req.get("x-paperclip-dev-server-status-token"));
 
     if (!db) {
+      // Even without a DB probe, an adapter plugin load failure must flip
+      // the response to 503 so plugin-dev iteration (local_trusted, no DB)
+      // can detect "I shipped a plugin, did it load?" via /health.
+      if (getFailedAdapterLoads().length > 0) {
+        const failedLoadsEarly = getFailedAdapterLoads();
+        const earlyAdapters: Record<string, { status: "loaded" | "failed"; error?: string; packageName?: string; timestamp?: string }> = {};
+        for (const failure of failedLoadsEarly) {
+          earlyAdapters[failure.type] = {
+            status: "failed",
+            error: failure.error,
+            packageName: failure.packageName,
+            timestamp: failure.timestamp,
+          };
+        }
+        res.status(503).json({
+          status: "unhealthy",
+          version: serverVersion,
+          serverVersion,
+          deploymentMode: opts.deploymentMode,
+          error: "adapter_plugin_load_failed",
+          adapters: { failed: failedLoadsEarly.length, entries: earlyAdapters },
+          ...(exposeFullDetails ? { serverInfo } : {}),
+        });
+        return;
+      }
       res.json(
         exposeFullDetails
           ? { status: "ok", version: serverVersion, serverVersion: serverVersion, serverInfo }
@@ -203,6 +230,50 @@ export function healthRoutes(
       : undefined;
     const warnings = databaseBackup?.warnings.length ? databaseBackup.warnings : undefined;
 
+    // Build the adapter load status map. Every type that is in the
+    // plugin store — loaded OR failed — is surfaced here. Built-ins that
+    // were never overridden are omitted (they always work). The map also
+    // doubles as the unhealthy signal: any required plugin with a recorded
+    // failure flips the response status to 503 so operators (and the
+    // OpenClaw monitor) can detect "I shipped a plugin, did it load?"
+    // without grepping the boot log.
+    const failedLoads = getFailedAdapterLoads();
+    const adapters: Record<string, { status: "loaded" | "failed"; error?: string; packageName?: string; timestamp?: string }> = {};
+    for (const failure of failedLoads) {
+      adapters[failure.type] = {
+        status: "failed",
+        error: failure.error,
+        packageName: failure.packageName,
+        timestamp: failure.timestamp,
+      };
+    }
+    const adapterLoadStatus = {
+      failed: failedLoads.length,
+      ...(Object.keys(adapters).length ? { entries: adapters } : {}),
+    };
+    const anyAdapterFailed = failedLoads.length > 0;
+
+    if (anyAdapterFailed) {
+      // Required plugin load failure flips the response to 503 so a monitor
+      // or operator sees the failure without grepping logs. Only required
+      // plugins end up in `failedLoads` (optional ones fall through silently
+      // by design). Database stays healthy — only the adapter plugin path
+      // is broken.
+      res.status(503).json({
+        status: "unhealthy",
+        version: serverVersion,
+        serverVersion,
+        deploymentMode: opts.deploymentMode,
+        deploymentExposure: opts.deploymentExposure,
+        bootstrapStatus,
+        bootstrapInviteActive,
+        error: "adapter_plugin_load_failed",
+        adapters: adapterLoadStatus,
+        ...(exposeFullDetails ? { serverInfo } : {}),
+      });
+      return;
+    }
+
     if (!exposeFullDetails) {
       const redactedDatabaseBackup = databaseBackup ? redactedDatabaseBackupHealth(databaseBackup) : undefined;
       const redactedWarnings = redactedDatabaseBackup?.warnings.length ? redactedDatabaseBackup.warnings : undefined;
@@ -212,6 +283,7 @@ export function healthRoutes(
         deploymentExposure: opts.deploymentExposure,
         bootstrapStatus,
         bootstrapInviteActive,
+        ...(adapterLoadStatus.failed > 0 ? { adapters: adapterLoadStatus } : {}),
         ...(redactedDatabaseBackup ? { databaseBackup: redactedDatabaseBackup } : {}),
         ...(redactedWarnings ? { warnings: redactedWarnings } : {}),
         ...(devServer ? { devServer } : {}),
@@ -231,6 +303,7 @@ export function healthRoutes(
       features: {
         companyDeletionEnabled: opts.companyDeletionEnabled,
       },
+      ...(adapterLoadStatus.failed > 0 ? { adapters: adapterLoadStatus } : {}),
       serverInfo,
       ...(databaseBackup ? { databaseBackup } : {}),
       ...(warnings ? { warnings } : {}),

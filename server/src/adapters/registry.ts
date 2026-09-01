@@ -122,7 +122,12 @@ import {
   modelProfiles as piModelProfiles,
 } from "@paperclipai/adapter-pi-local";
 import { BUILTIN_ADAPTER_TYPES } from "./builtin-adapter-types.js";
-import { buildExternalAdapters } from "./plugin-loader.js";
+import {
+  buildExternalAdapters,
+  getFailedAdapterLoads,
+  getAdapterLoadStatus,
+  type AdapterLoadStatus,
+} from "./plugin-loader.js";
 import { getDisabledAdapterTypes } from "../services/adapter-plugin-store.js";
 import { processAdapter } from "./process/index.js";
 import { httpAdapter } from "./http/index.js";
@@ -524,6 +529,15 @@ const externalAdaptersReady: Promise<void> = (async () => {
         resolveExternalAdapterRegistration(externalAdapter),
       );
     }
+    // Loudly summarize any required plugin that failed to load so the boot
+    // log shows the failure even when nothing else does. Optional-plugin
+    // failures are already warn-logged by loadFromRecord.
+    const failed = getFailedAdapterLoads();
+    for (const failure of failed) {
+      console.error(
+        `[paperclip] External adapter "${failure.packageName}" (type=${failure.type}) FAILED to load: ${failure.error}. Built-in is NOT promoted as a fallback because the plugin is required (set package.json paperclip.optional=true to opt in to silent fallback).`,
+      );
+    }
   } catch (err) {
     console.error("[paperclip] Failed to load external adapters:", err);
   }
@@ -723,6 +737,30 @@ export function getPausedOverrides(): Set<string> {
 
 export function findServerAdapter(type: string): ServerAdapterModule | null {
   return adaptersByType.get(type) ?? null;
+}
+
+/**
+ * Compute the load status for an adapter type, combining the registry's
+ * "in the adapter map" view with the plugin-loader's failedLoads map.
+ *
+ * Returns:
+ * - `"loaded"`        — adapter is registered (built-in or external that loaded)
+ * - `"failed"`        — a record exists in the plugin store AND that load failed
+ *                       (broken entry point, missing module, validation threw)
+ * - `"not_declared"`  — no plugin-store record exists for this type, AND the
+ *                       adapter is not in the registry (covers built-ins too:
+ *                       a built-in is always "loaded" because it ships in the
+ *                       binary; only an externally-declared plugin can be in
+ *                       this state because the caller would only invoke this
+ *                       for types the operator cares about)
+ *
+ * Operators and agents use this to verify a fix is live without grepping the
+ * server log: GET /api/adapters/:type now returns this status verbatim.
+ */
+export function findAdapterLoadStatus(type: string): AdapterLoadStatus {
+  if (getAdapterLoadStatus(type) === "failed") return "failed";
+  if (findServerAdapter(type)) return "loaded";
+  return "not_declared";
 }
 
 export function findActiveServerAdapter(type: string): ServerAdapterModule | null {

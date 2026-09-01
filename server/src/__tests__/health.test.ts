@@ -10,6 +10,23 @@ import * as devServerStatus from "../dev-server-status.js";
 import { serverVersion } from "../version.js";
 
 const mockReadPersistedDevServerStatus = vi.hoisted(() => vi.fn());
+const mockGetFailedAdapterLoads = vi.hoisted(() => vi.fn(() => [] as Array<{
+  type: string;
+  packageName: string;
+  packageDir: string;
+  error: string;
+  optional: boolean;
+  timestamp: string;
+}>));
+const mockFindAdapterLoadStatus = vi.hoisted(() => vi.fn((_type: string) => "not_declared" as const));
+
+vi.mock("../adapters/plugin-loader.js", () => ({
+  getFailedAdapterLoads: mockGetFailedAdapterLoads,
+}));
+vi.mock("../adapters/registry.js", () => ({
+  findAdapterLoadStatus: mockFindAdapterLoadStatus,
+}));
+
 const testServerInfo = {
   processStartedAt: "2026-06-26T00:00:00.000Z",
   git: {
@@ -498,5 +515,70 @@ describe("GET /health", () => {
       bootstrapStatus: "ready",
       bootstrapInviteActive: false,
     });
+  });
+
+  // ──────────────────────────────────────────────────────────────────
+  // PHA-1658: plugin load failures must surface in startup health.
+  // When any required plugin is in the failedLoads map, /health must
+  // return 503 with a structured adapters block — not the silent 200 OK
+  // it returned before. Operators and monitors can then alert.
+  // ──────────────────────────────────────────────────────────────────
+
+  it("returns 200 with adapters block when no plugins have failed", async () => {
+    mockGetFailedAdapterLoads.mockReturnValue([]);
+    const app = createApp();
+    const res = await request(app).get("/health");
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("ok");
+    // No `adapters` key when nothing failed — backward compatible.
+    expect(res.body.adapters).toBeUndefined();
+  });
+
+  it("returns 503 with adapters block when a required plugin failed to load", async () => {
+    mockGetFailedAdapterLoads.mockReturnValue([
+      {
+        type: "broken_plugin_test",
+        packageName: "@paperclip/broken-plugin",
+        packageDir: "/tmp/paperclip-broken",
+        error: "Cannot find module 'does-not-exist.js'",
+        optional: false,
+        timestamp: "2026-09-01T00:00:00.000Z",
+      },
+    ]);
+    const app = createApp();
+    const res = await request(app).get("/health");
+    expect(res.status).toBe(503);
+    expect(res.body).toMatchObject({
+      status: "unhealthy",
+      error: "adapter_plugin_load_failed",
+      adapters: {
+        failed: 1,
+        entries: {
+          broken_plugin_test: {
+            status: "failed",
+            packageName: "@paperclip/broken-plugin",
+            error: "Cannot find module 'does-not-exist.js'",
+            timestamp: "2026-09-01T00:00:00.000Z",
+          },
+        },
+      },
+    });
+  });
+
+  it("still reports the failure even with no database (deploymentMode=local_trusted keeps full details)", async () => {
+    mockGetFailedAdapterLoads.mockReturnValue([
+      {
+        type: "broken_plugin_test",
+        packageName: "@paperclip/broken",
+        packageDir: "/tmp/x",
+        error: "boom",
+        optional: false,
+        timestamp: "2026-09-01T00:00:00.000Z",
+      },
+    ]);
+    const app = createApp(); // no db → no DB probe path, but adapter check still fires
+    const res = await request(app).get("/health");
+    expect(res.status).toBe(503);
+    expect(res.body.error).toBe("adapter_plugin_load_failed");
   });
 });

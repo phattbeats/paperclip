@@ -29,6 +29,7 @@ import {
   unregisterServerAdapter,
   isOverridePaused,
   setOverridePaused,
+  findAdapterLoadStatus,
 } from "../adapters/registry.js";
 import {
   listAdapterPlugins,
@@ -41,7 +42,7 @@ import {
 } from "../services/adapter-plugin-store.js";
 import type { AdapterPluginRecord } from "../services/adapter-plugin-store.js";
 import type { ServerAdapterModule, AdapterConfigSchema } from "../adapters/types.js";
-import { loadExternalAdapterPackage, getUiParserSource, getOrExtractUiParserSource, reloadExternalAdapter } from "../adapters/plugin-loader.js";
+import { loadExternalAdapterPackage, getUiParserSource, getOrExtractUiParserSource, reloadExternalAdapter, getFailedAdapterLoads } from "../adapters/plugin-loader.js";
 import { logger } from "../middleware/logger.js";
 import { forbidden } from "../errors.js";
 import { isCloudManagedInstance } from "../middleware/auth.js";
@@ -93,7 +94,19 @@ interface AdapterInfo {
   label: string;
   source: "builtin" | "external";
   modelsCount: number;
-  loaded: boolean;
+  /**
+   * Granular load status:
+   * - `"loaded"`       — adapter is in the registry and serving traffic
+   * - `"failed"`       — plugin-store record exists but the load threw (see
+   *                      getFailedAdapterLoads for the error detail)
+   * - `"not_declared"` — no plugin-store record AND not in the registry
+   *
+   * This replaces the previous boolean `loaded: true` field. Callers that
+   * want a boolean can derive it as `info.loaded === "loaded"`.
+   */
+  loaded: "loaded" | "failed" | "not_declared";
+  /** Structured error detail when `loaded === "failed"`. */
+  loadError?: { packageName: string; error: string; timestamp: string };
   disabled: boolean;
   capabilities: AdapterCapabilities;
   acp?: ServerAdapterModule["acp"];
@@ -152,7 +165,7 @@ function buildAdapterInfo(adapter: ServerAdapterModule, externalRecord: AdapterP
     label: adapter.type, // ServerAdapterModule doesn't have a separate "label" field; type serves as label
     source: externalRecord ? "external" : "builtin",
     modelsCount: (adapter.models ?? []).length,
-    loaded: true, // If it's in the registry, it's loaded
+    loaded: "loaded",
     disabled: disabledSet.has(adapter.type),
     capabilities: buildAdapterCapabilities(adapter),
     ...(adapter.acp ? { acp: adapter.acp } : {}),
@@ -162,6 +175,37 @@ function buildAdapterInfo(adapter: ServerAdapterModule, externalRecord: AdapterP
     version: fromDisk ?? externalRecord?.version,
     packageName: externalRecord?.packageName,
     isLocalPath: externalRecord?.localPath ? true : undefined,
+  };
+}
+
+/**
+ * Build an AdapterInfo for a type that has no registry entry but DOES have
+ * a plugin-store record — i.e. the plugin is in the store but failed to
+ * load. Used by GET /api/adapters/:type so a 404 doesn't mask a broken
+ * plugin: the operator gets a 200 with `loaded: "failed"` and the error.
+ */
+function buildFailedAdapterInfo(externalRecord: AdapterPluginRecord, failure: { packageName: string; error: string; timestamp: string }): AdapterInfo {
+  return {
+    type: externalRecord.type,
+    label: externalRecord.type,
+    source: "external",
+    modelsCount: 0,
+    loaded: "failed",
+    loadError: failure,
+    disabled: false,
+    capabilities: {
+      supportsInstructionsBundle: false,
+      supportsSkills: false,
+      supportsLocalAgentJwt: false,
+      requiresMaterializedRuntimeSkills: false,
+      supportsModelProfiles: false,
+      supportsAcp: false,
+    },
+    overriddenBuiltin: BUILTIN_ADAPTER_TYPES.has(externalRecord.type) || undefined,
+    overridePaused: BUILTIN_ADAPTER_TYPES.has(externalRecord.type) ? isOverridePaused(externalRecord.type) : undefined,
+    version: readAdapterPackageVersionFromDisk(externalRecord),
+    packageName: externalRecord.packageName,
+    isLocalPath: externalRecord.localPath ? true : undefined,
   };
 }
 
@@ -377,13 +421,46 @@ export function adapterRoutes() {
 
     const adapterType = req.params.type;
     const adapter = findServerAdapter(adapterType);
+    const externalRecord = getAdapterPluginByType(adapterType);
+    const disabledSet = new Set(getDisabledAdapterTypes());
+
+    // If the registry has no entry but the plugin store does, the plugin
+    // failed to load. Return 200 with loaded: "failed" so an agent can
+    // verify the failure mode without parsing logs.
     if (!adapter) {
+      if (externalRecord) {
+        // Find the matching load-failure record, if any.
+        const failures = getFailedAdapterLoads();
+        const failure = failures.find((f) => f.type === adapterType);
+        if (failure) {
+          res.json(buildFailedAdapterInfo(externalRecord, failure));
+          return;
+        }
+        // Record exists but no failure recorded: it must be an optional
+        // plugin that silently fell through to the built-in. Report as
+        // "loaded" via the built-in (handled below) by reporting not_declared
+        // for the plugin specifically — but the existing registry lookup
+        // will not find it, so we explicitly return not_declared.
+        res.json({
+          type: adapterType,
+          label: adapterType,
+          source: "external",
+          loaded: "not_declared",
+          modelsCount: 0,
+          disabled: false,
+          packageName: externalRecord.packageName,
+          isLocalPath: externalRecord.localPath ? true : undefined,
+          version: readAdapterPackageVersionFromDisk(externalRecord),
+        });
+        return;
+      }
       res.status(404).json({ error: `Adapter "${adapterType}" is not registered.` });
       return;
     }
 
-    const externalRecord = getAdapterPluginByType(adapterType);
-    const disabledSet = new Set(getDisabledAdapterTypes());
+    // Loaded adapter — attach the load status (always "loaded" here, but
+    // exposing it in the response keeps the shape consistent across the
+    // failed/not_declared/loaded paths the caller has to handle).
     res.json(buildAdapterInfo(adapter, externalRecord, disabledSet));
   });
 
@@ -545,7 +622,11 @@ export function adapterRoutes() {
       return;
     }
 
-    // Reload the adapter module (busts ESM cache, re-imports)
+    // Reload the adapter module (busts ESM cache, re-imports).
+    // reloadExternalAdapter now throws (instead of returning null) on actual
+    // load failure, so the structured 5xx body below distinguishes the three
+    // outcomes: 200 (reloaded), 404 (not an external adapter), 500 (failed
+    // to load — error body contains the failure detail for the agent).
     try {
       const newModule = await reloadExternalAdapter(type);
 
@@ -576,7 +657,15 @@ export function adapterRoutes() {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       logger.error({ err, type }, "Failed to reload external adapter");
-      res.status(500).json({ error: `Failed to reload adapter: ${message}` });
+      // Structured body — agents can parse this without scraping logs.
+      // Mirrors the shape of GET /api/adapters/:type when loaded === "failed".
+      res.status(500).json({
+        error: `Failed to reload adapter: ${message}`,
+        type,
+        loaded: "failed",
+        packageName: getAdapterPluginByType(type)?.packageName,
+        loadError: message,
+      });
     }
   });
 

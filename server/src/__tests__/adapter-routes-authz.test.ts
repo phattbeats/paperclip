@@ -34,6 +34,8 @@ const mocks = vi.hoisted(() => {
     reloadExternalAdapter: vi.fn(),
     getUiParserSource: vi.fn(),
     getOrExtractUiParserSource: vi.fn(),
+    getFailedAdapterLoads: vi.fn(() => []),
+    getAdapterLoadStatus: vi.fn(() => "not_declared" as const),
   };
 });
 
