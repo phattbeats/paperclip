@@ -4861,12 +4861,16 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           bumpExecutionWorkspaceLifecycleGeneration(baseMetadata),
         );
         await measureRunPhase("workspace.notification", () => notifyTerminalWorkspaceWork(tx, `workspace:${input.id}`));
+        const cleanupEligibleAt = Object.hasOwn(nextPatch, "cleanupEligibleAt")
+          ? nextPatch.cleanupEligibleAt ?? null
+          : fresh.cleanupEligibleAt ?? input.closedAt;
         const archived = await tx
           .update(executionWorkspaces)
           .set({
             ...nextPatch,
             status: "archived",
             closedAt: input.closedAt,
+            cleanupEligibleAt,
             cleanupReason: null,
             metadata: archiveMetadata,
             updatedAt: new Date(),

@@ -865,6 +865,29 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
       expect(row).toMatchObject({ status: "active", cleanupEligibleAt: null });
       await expect(fs.readFile(path.join(seed.cwd, "uncommitted.txt"), "utf8")).resolves.toBe("keep this work\n");
     }, 20_000);
+
+    it("sets cleanup_eligible_at when the archive API closes a workspace", async () => {
+      const seed = await seedLocalFilesystemWorkspace();
+      const closedAt = new Date("2026-11-02T12:00:00Z");
+
+      const result = await svc.archiveWorkspaceUnderLifecycleLock({
+        id: seed.executionWorkspaceId,
+        patch: {},
+        closedAt,
+      });
+
+      expect(result?.outcome).toBe("archived");
+      const [archived] = await db
+        .select({
+          status: executionWorkspaces.status,
+          closedAt: executionWorkspaces.closedAt,
+          cleanupEligibleAt: executionWorkspaces.cleanupEligibleAt,
+        })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, seed.executionWorkspaceId));
+      expect(archived).toMatchObject({ status: "archived" });
+      expect(archived?.cleanupEligibleAt).toEqual(closedAt);
+    });
   });
 
   describe("delivery reads after a pooled disconnect", () => {
