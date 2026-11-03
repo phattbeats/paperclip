@@ -379,15 +379,26 @@ function pullRequestMatchesWorkspaceRepository(
   );
 }
 
+export function executionWorkspaceHasNoApplicableDelivery(
+  workspace: Pick<ExecutionWorkspaceRow, "providerType" | "branchName" | "repoUrl" | "baseRef">,
+  git: Pick<ExecutionWorkspaceCloseGitReadiness, "repoRoot" | "createdByRuntime"> | null,
+): boolean {
+  if (workspace.providerType !== "local_fs") return false;
+  if (!workspace.branchName && !workspace.repoUrl && !workspace.baseRef) return true;
+  return git !== null && !git.repoRoot && !git.createdByRuntime;
+}
+
 export function deriveExecutionWorkspaceDeliveryState(input: {
   sourceIssueTerminal: boolean;
   mergedPullRequest: boolean;
   pullRequestStateUnknown: boolean;
   isMergedIntoBase: boolean | null;
+  deliveryNotApplicable?: boolean;
 }): ExecutionWorkspaceDeliveryState {
   if (input.sourceIssueTerminal && input.mergedPullRequest) return "merged_via_pr";
   if (input.isMergedIntoBase === true) return "merged_by_ancestry";
   if (input.isMergedIntoBase === false && !input.pullRequestStateUnknown) return "unmerged";
+  if (input.deliveryNotApplicable) return "not_applicable";
   return "unknown";
 }
 
@@ -2047,6 +2058,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         sourceIssueTerminal,
         mergedPullRequest,
         pullRequestStateUnknown,
+        deliveryNotApplicable: executionWorkspaceHasNoApplicableDelivery(workspace, git),
         isMergedIntoBase: deliveryProof
           ? deliveryProof.evidence.kind === "ancestry" && deliveryProof.headSha === workspaceHeadSha
           : git?.isMergedIntoBase ?? null,
@@ -3854,7 +3866,8 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           readinessByWorkingTree.set(readinessKey, inspection);
         }
         const { git, statusInspectionSucceeded } = await inspection;
-        if (!statusInspectionSucceeded) {
+        const deliveryNotApplicable = executionWorkspaceHasNoApplicableDelivery(workspace, git);
+        if (!statusInspectionSucceeded && !deliveryNotApplicable) {
           if (remoteWorkspace) terminalWorkspaceDeadlines.delete(workspace.id);
           result.skippedUndelivered += 1;
           continue;
@@ -3888,6 +3901,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         if (
           assessment.deliveryState !== "merged_via_pr"
           && assessment.deliveryState !== "merged_by_ancestry"
+          && assessment.deliveryState !== "not_applicable"
         ) {
           if (remoteWorkspace) terminalWorkspaceDeadlines.delete(workspace.id);
           result.skippedUndelivered += 1;

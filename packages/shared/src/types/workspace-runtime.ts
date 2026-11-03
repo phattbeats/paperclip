@@ -41,6 +41,7 @@ export type ExecutionWorkspaceDeliveryState =
   | "merged_via_pr"
   | "merged_by_ancestry"
   | "unmerged"
+  | "not_applicable"
   | "unknown";
 
 export type ExecutionWorkspaceCloseReadinessState =

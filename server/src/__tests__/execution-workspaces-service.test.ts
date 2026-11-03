@@ -772,6 +772,101 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(archived?.cleanupEligibleAt).toBeInstanceOf(Date);
   }, 20_000);
 
+  describe("workspaces with no applicable delivery", () => {
+    async function seedLocalFilesystemWorkspace(options: {
+      gitDirectory?: boolean;
+      dirty?: boolean;
+    } = {}) {
+      const companyId = randomUUID();
+      const projectId = randomUUID();
+      const executionWorkspaceId = randomUUID();
+      const sourceIssueId = randomUUID();
+      const issuePrefix = `P${companyId.slice(0, 8).toUpperCase()}`;
+      const identifier = `${issuePrefix}-1`;
+      const cwd = options.gitDirectory
+        ? await createTempRepo()
+        : await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-local-fs-"));
+      tempDirs.add(cwd);
+      if (options.dirty) {
+        await fs.writeFile(path.join(cwd, "uncommitted.txt"), "keep this work\n", "utf8");
+      }
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix,
+        requireBoardApprovalForNewAgents: false,
+      });
+      await db.insert(projects).values({
+        id: projectId,
+        companyId,
+        name: "Local filesystem workspaces",
+        status: "in_progress",
+      });
+      await db.insert(executionWorkspaces).values({
+        id: executionWorkspaceId,
+        companyId,
+        projectId,
+        mode: "shared_workspace",
+        strategyType: "project_primary",
+        name: identifier,
+        status: "active",
+        cwd,
+        providerType: "local_fs",
+      });
+      await db.insert(issues).values({
+        id: sourceIssueId,
+        companyId,
+        projectId,
+        identifier,
+        title: "Local filesystem source issue",
+        status: "done",
+        priority: "medium",
+        completedAt: new Date("2020-01-01T00:00:00Z"),
+        executionWorkspaceId,
+      });
+      await db
+        .update(executionWorkspaces)
+        .set({ sourceIssueId, updatedAt: new Date("2020-01-01T00:00:00Z") })
+        .where(eq(executionWorkspaces.id, executionWorkspaceId));
+      return { companyId, projectId, executionWorkspaceId, sourceIssueId, cwd };
+    }
+
+    it("archives a terminal local filesystem workspace that has nothing to deliver", async () => {
+      const seed = await seedLocalFilesystemWorkspace();
+
+      expect(await svc.sweepTerminalWorkspaces()).toMatchObject({ archived: 1, skippedUndelivered: 0 });
+
+      const [archived] = await db
+        .select({
+          status: executionWorkspaces.status,
+          closedAt: executionWorkspaces.closedAt,
+          cleanupEligibleAt: executionWorkspaces.cleanupEligibleAt,
+          cleanupReason: executionWorkspaces.cleanupReason,
+        })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, seed.executionWorkspaceId));
+
+      expect(archived).toMatchObject({ status: "archived" });
+      expect(archived?.closedAt).toBeInstanceOf(Date);
+      expect(archived?.cleanupEligibleAt).toEqual(archived?.closedAt);
+      await expect(fs.access(seed.cwd)).resolves.toBeUndefined();
+    }, 20_000);
+
+    it("keeps a local filesystem workspace that holds uncommitted files", async () => {
+      const seed = await seedLocalFilesystemWorkspace({ gitDirectory: true, dirty: true });
+
+      expect(await svc.sweepTerminalWorkspaces()).toMatchObject({ archived: 0, skippedUndelivered: 1 });
+
+      const [row] = await db
+        .select({ status: executionWorkspaces.status, cleanupEligibleAt: executionWorkspaces.cleanupEligibleAt })
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, seed.executionWorkspaceId));
+
+      expect(row).toMatchObject({ status: "active", cleanupEligibleAt: null });
+      await expect(fs.readFile(path.join(seed.cwd, "uncommitted.txt"), "utf8")).resolves.toBe("keep this work\n");
+    }, 20_000);
+  });
+
   describe("delivery reads after a pooled disconnect", () => {
     const issueTreeFields = "id,status,completedAt,cancelledAt,updatedAt";
     const pullRequestProductFields = "id,url,externalId,title,summary,metadata";
@@ -2406,7 +2501,7 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
 
     expect(readiness).toMatchObject({
       workspaceId: executionWorkspaceId,
-      deliveryState: "unknown",
+      deliveryState: "not_applicable",
       state: "ready_with_warnings",
       isSharedWorkspace: true,
       isProjectPrimaryWorkspace: true,

@@ -4476,7 +4476,12 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
 
   const cleaned =
     !workspacePath ||
-    !(await directoryExists(workspacePath));
+    !(await directoryExists(workspacePath)) ||
+    (
+      input.workspace.providerType === "local_fs"
+      && !createdByRuntime
+      && warnings.length === 0
+    );
   if (cleaned) warnings.push(...await releaseNestedRepositoryWorktrees(nestedWorktrees));
 
   return {
