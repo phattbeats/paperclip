@@ -636,7 +636,7 @@ export const ENVIRONMENT_CUSTOM_IMAGE_SETUP_CONNECTION_TYPES = [
 export type EnvironmentCustomImageSetupConnectionType =
   (typeof ENVIRONMENT_CUSTOM_IMAGE_SETUP_CONNECTION_TYPES)[number];
 
-export const ROUTINE_STATUSES = ["active", "paused", "archived"] as const;
+export const ROUTINE_STATUSES = ["active", "paused", "archived", "retired"] as const;
 export type RoutineStatus = (typeof ROUTINE_STATUSES)[number];
 
 export const ROUTINE_CONCURRENCY_POLICIES = ["coalesce_if_active", "always_enqueue", "skip_if_active"] as const;

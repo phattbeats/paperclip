@@ -391,6 +391,10 @@ function assertScheduleCompatibleVariables(variables: RoutineVariable[]) {
   }
 }
 
+function isRetiredRoutineStatus(status: string) {
+  return status === "archived" || status === "retired";
+}
+
 function statusRequiresDefaultAgent(status: string) {
   return status === "active";
 }
@@ -2018,9 +2022,10 @@ export function routineService(
 
     list: async (
       companyId: string,
-      filters?: { projectId?: string | null },
+      filters?: { projectId?: string | null; includeRetired?: boolean },
     ): Promise<RoutineListItem[]> => {
       const conditions = [eq(routines.companyId, companyId)];
+      if (!filters?.includeRetired) conditions.push(ne(routines.status, "retired"));
       if (filters?.projectId) conditions.push(eq(routines.projectId, filters.projectId));
 
       const rows = await db
@@ -2066,7 +2071,11 @@ export function routineService(
           : null,
         row.parentIssueId ? issueSvc.getById(row.parentIssueId) : null,
         getRoutineDescriptionDocument(row.id),
-        db.select().from(routineTriggers).where(and(eq(routineTriggers.routineId, row.id), eq(routineTriggers.archived, false))).orderBy(asc(routineTriggers.createdAt)),
+        db.select().from(routineTriggers).where(
+          isRetiredRoutineStatus(row.status)
+            ? eq(routineTriggers.routineId, row.id)
+            : and(eq(routineTriggers.routineId, row.id), eq(routineTriggers.archived, false)),
+        ).orderBy(asc(routineTriggers.createdAt)),
         db
           .select({
             id: routineRuns.id,
@@ -2325,6 +2334,15 @@ export function routineService(
           updatedByAgentId: actor.agentId ?? null,
           updatedByUserId: actor.userId ?? null,
         };
+
+        if (isRetiredRoutineStatus(candidate.status) && !isRetiredRoutineStatus(locked.status)) {
+          // Retire trigger state in the same transaction as the status change so
+          // reads never report a live trigger on an archived/retired routine.
+          await txDb
+            .update(routineTriggers)
+            .set({ archived: true, enabled: false, nextRunAt: null, updatedAt: new Date() })
+            .where(and(eq(routineTriggers.routineId, id), eq(routineTriggers.archived, false)));
+        }
 
         const folderChanged = patch.folderId !== undefined && locked.folderId !== candidate.folderId;
         if (locked.latestRevisionId && routineCurrentFieldsMatch(locked, candidate)) {
@@ -2823,7 +2841,7 @@ export function routineService(
     runRoutine: async (id: string, input: RunRoutine, actor?: Actor) => {
       const routine = await getRoutineById(id);
       if (!routine) throw notFound("Routine not found");
-      if (routine.status === "archived") throw conflict("Routine is archived");
+      if (isRetiredRoutineStatus(routine.status)) throw conflict(`Routine is ${routine.status}`);
       await assertProject(routine.companyId, input.projectId ?? null);
       const assigneeAgentId = input.assigneeAgentId ?? routine.assigneeAgentId ?? null;
       await assertAssignableAgent(db, routine.companyId, assigneeAgentId, { kind: "routine" });
@@ -2871,7 +2889,7 @@ export function routineService(
         if (!trigger || trigger.archived) throw notFound("Routine trigger not found");
         const routine = await txDb.select().from(routines).where(eq(routines.id, trigger.routineId)).then((rows) => rows[0]);
         if (!routine) throw notFound("Routine not found");
-        if (routine.status === "archived") throw conflict("Routine is archived");
+        if (isRetiredRoutineStatus(routine.status)) throw conflict(`Routine is ${routine.status}`);
         if (!trigger.enabled || (!trigger.setupPending && routine.status !== "active")) throw conflict("Routine trigger is not active");
         const recordDelivery = async (status: "received" | "rejected") => {
           const receivedAt = new Date().toISOString();
