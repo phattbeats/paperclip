@@ -1137,6 +1137,44 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(restoredTrigger?.publicId).not.toBe(created.trigger.publicId);
   });
 
+  it("archiving a routine retires its triggers and produces zero runs", async () => {
+    const { companyId, routine, svc } = await seedFixture();
+    const { trigger } = await svc.createTrigger(routine.id, {
+      kind: "schedule", label: "minutely", cronExpression: "* * * * *", timezone: "UTC",
+    }, {});
+    await db.update(routineTriggers).set({ nextRunAt: new Date("2020-01-01T00:00:00.000Z") }).where(eq(routineTriggers.id, trigger.id));
+
+    await svc.update(routine.id, { status: "archived" }, {});
+
+    const [row] = await db.select().from(routineTriggers).where(eq(routineTriggers.id, trigger.id));
+    expect(row).toMatchObject({ archived: true, enabled: false, nextRunAt: null });
+    const detail = await svc.getDetail(routine.id);
+    expect(detail?.triggers).toEqual([
+      expect.objectContaining({ id: trigger.id, archived: true, enabled: false, nextRunAt: null }),
+    ]);
+    expect(await svc.tickScheduledTriggers(new Date())).toEqual({ triggered: 0 });
+    const runs = await db.select().from(routineRuns).where(eq(routineRuns.routineId, routine.id));
+    expect(runs).toHaveLength(0);
+    expect(companyId).toBeTruthy();
+  });
+
+  it("retired routines are hidden from the default list but reachable by id", async () => {
+    const { companyId, routine, svc } = await seedFixture();
+    const { trigger } = await svc.createTrigger(routine.id, {
+      kind: "schedule", label: "daily", cronExpression: "0 8 * * *", timezone: "UTC",
+    }, {});
+
+    const retired = await svc.update(routine.id, { status: "retired" }, {});
+    expect(retired?.status).toBe("retired");
+
+    expect((await svc.list(companyId)).map((entry) => entry.id)).not.toContain(routine.id);
+    expect((await svc.list(companyId, { includeRetired: true })).map((entry) => entry.id)).toContain(routine.id);
+    expect((await svc.get(routine.id))?.status).toBe("retired");
+    const [row] = await db.select().from(routineTriggers).where(eq(routineTriggers.id, trigger.id));
+    expect(row).toMatchObject({ archived: true, enabled: false, nextRunAt: null });
+    await expect(svc.runRoutine(routine.id, {} as never)).rejects.toThrow(/retired/);
+  });
+
   it("persists custom schedule cron expressions exactly", async () => {
     const { companyId, routine, svc } = await seedFixture();
     const cronExpression = "0 8-18/2 * * 1-5";

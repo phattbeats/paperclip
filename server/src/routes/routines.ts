@@ -150,7 +150,8 @@ export function routineRoutes(
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const projectId = typeof req.query.projectId === "string" ? req.query.projectId : undefined;
-    const result = await svc.list(companyId, { projectId });
+    const includeRetired = req.query.includeRetired === "true";
+    const result = await svc.list(companyId, { projectId, includeRetired });
     res.json(result);
   });
 
